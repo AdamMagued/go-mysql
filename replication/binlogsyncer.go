@@ -82,25 +82,46 @@ type BinlogSyncerConfig struct {
 	// RenderJSONAsMySQLText, when true, makes the JSONB decoder emit text
 	// that is faithful to each value's original JSONB type tag where the
 	// JSON text grammar can express it. The default decode->json.Marshal
-	// path is lossy for DOUBLE and (less importantly) NEWDECIMAL, which
-	// matters when replaying the output back into a MySQL JSON column.
+	// path is lossy (see the "not ..." notes below), which matters when
+	// replaying the output back into a MySQL JSON column.
 	//
 	// Per-tag behaviour:
-	//   - JSONB_DOUBLE 1.0 renders as "1.0" (not "1"), so MySQL re-stores
-	//     it as JSONB_DOUBLE rather than JSONB_INT.
-	//   - JSONB_OPAQUE NEWDECIMAL renders as an unquoted number rather
-	//     than a quoted string. Note that MySQL's JSON text grammar has
-	//     no syntax for a decimal literal: re-inserting the text creates
-	//     a JSON DOUBLE, not the original JSONB_OPAQUE NEWDECIMAL. The
-	//     numeric value is preserved, the opaque type tag is not.
+	//   - JSONB_DOUBLE 1.0 renders as "1.0" (not "1", unless
+	//     UseFloatWithTrailingZero is set), so MySQL re-stores it as
+	//     JSONB_DOUBLE rather than JSONB_INT.
+	//   - JSONB_OPAQUE NEWDECIMAL renders as an unquoted number (not a
+	//     quoted string, unless UseDecimal and
+	//     decimal.MarshalJSONWithoutQuotes are both set).
 	//   - JSONB_OPAQUE DATE renders as "YYYY-MM-DD" (not the legacy
 	//     "YYYY-MM-DD 00:00:00.000000").
 	//   - JSONB_OPAQUE values of unrecognised inner types render as
-	//     "base64:typeN:<b64>" (matching mysqld) instead of the raw
-	//     payload bytes.
+	//     "base64:typeN:<b64>" (not the raw payload bytes, with invalid
+	//     UTF-8 replaced by U+FFFD). mysqld differs in two cases: it
+	//     breaks the base64 with a newline every 76 characters, and it
+	//     prints a VAR_STRING (type 253) payload as a plain string.
 	//   - Object key order is preserved from the JSONB stream
 	//     (length-then-bytes) instead of the lexicographic order Go maps
 	//     produce, matching MySQL's own text output.
+	//
+	// Re-inserting the text can change JSONB types and values. MySQL's
+	// own JSON text has the same limits, apart from the two opaque cases
+	// above. Changes include:
+	//   - NEWDECIMAL loses its type, precision and scale, since JSON text
+	//     has no decimal literal. A value with a positive scale becomes
+	//     DOUBLE (1.50 becomes 1.5), and a scale-0 value becomes INTEGER,
+	//     UNSIGNED INTEGER or DOUBLE by its range. Conversion to DOUBLE
+	//     can round the value.
+	//   - Opaque DATE, TIME, DATETIME and TIMESTAMP values become STRING.
+	//   - Other opaque values become the STRING "base64:typeN:<b64>".
+	//   - INTEGER or UNSIGNED INTEGER is chosen by value: a signed value
+	//     above 4294967295 becomes UNSIGNED INTEGER, and an unsigned value
+	//     up to 4294967295 becomes INTEGER.
+	//   - Some MySQL versions, 8.4.8 among them, parse some doubles back
+	//     an ulp or two off (MySQL bug reports #116160 and #112904).
+	//
+	// Opaque values come only from SQL values such as DECIMAL, DATE or
+	// BLOB, e.g. JSON_OBJECT('v', 1.5), where 1.5 is a DECIMAL literal.
+	// JSON inserted as text contains none.
 	//
 	// Other notes:
 	//   - UseDecimal and UseFloatWithTrailingZero have no effect on JSON
@@ -112,6 +133,15 @@ type BinlogSyncerConfig struct {
 
 	// RecvBufferSize sets the size in bytes of the operating system's receive buffer associated with the connection.
 	RecvBufferSize int
+
+	// ReadAheadBufferSize enables transport-independent packet read-ahead when
+	// positive. Zero (the default) or negative values keep synchronous reads.
+	// TLS and plaintext use the same queue and ordered parser. This limits the
+	// charged packet capacity in queued/consumed batches, not total process RSS:
+	// one pending batch is outside the budget, and an oversized packet is
+	// admitted alone. Parsed events retained downstream are not covered.
+	// Semi-sync keeps synchronous reads to preserve packet sequence/ACK ownership.
+	ReadAheadBufferSize int
 
 	// master heartbeat period
 	HeartbeatPeriod time.Duration
@@ -167,6 +197,7 @@ type BinlogSyncerConfig struct {
 
 	// PayloadDecoderConcurrency is used to control concurrency for decoding TransactionPayloadEvent.
 	// Default 0,  this will be set to GOMAXPROCS.
+	// Negative values are invalid and are treated as 0 (GOMAXPROCS).
 	PayloadDecoderConcurrency int
 
 	// SynchronousEventHandler is used for synchronous event handling.
@@ -280,7 +311,7 @@ func (b *BinlogSyncer) close() {
 		if err := b.c.SetReadDeadline(utils.Now().Add(100 * time.Millisecond)); err != nil {
 			b.cfg.Logger.Warn("could not set read deadline, closing connection to unblock reader",
 				slog.Any("error", err))
-			if err := b.c.Close(); err != nil {
+			if err := b.c.Conn.Conn.Close(); err != nil {
 				b.cfg.Logger.Warn("could not close connection", slog.Any("error", err))
 			}
 		}
@@ -299,6 +330,11 @@ func (b *BinlogSyncer) close() {
 	}
 
 	b.wg.Wait()
+
+	// evict the parser's cached zstd decoder
+	if b.parser != nil {
+		b.parser.Close()
+	}
 
 	if b.c != nil {
 		b.c.Close()
@@ -337,11 +373,6 @@ func (b *BinlogSyncer) registerSlave() error {
 		if err = b.c.SetCharset(b.cfg.Charset); err != nil {
 			return errors.Trace(err)
 		}
-	}
-
-	// set read timeout
-	if b.cfg.ReadTimeout > 0 {
-		_ = b.c.SetReadDeadline(utils.Now().Add(b.cfg.ReadTimeout))
 	}
 
 	if b.cfg.RecvBufferSize > 0 {
@@ -515,11 +546,12 @@ func (b *BinlogSyncer) StartSync(pos mysql.Position) (*BinlogStreamer, error) {
 }
 
 // StartSyncGTID starts syncing from the `gset` GTIDSet.
+// The syncer keeps its own copy of gset and does not modify the caller's set.
 func (b *BinlogSyncer) StartSyncGTID(gset mysql.GTIDSet) (*BinlogStreamer, error) {
 	b.cfg.Logger.Info("begin to sync binlog from GTID set", slog.Any("GTID set", gset))
 
 	b.prevMySQLGTIDEvent = nil
-	b.prevGset = gset
+	b.prevGset = gset.Clone()
 
 	b.m.Lock()
 	defer b.m.Unlock()
@@ -798,8 +830,24 @@ func (b *BinlogSyncer) onStream(s *BinlogStreamer) {
 		b.wg.Done()
 	}()
 
+	var readAhead *packetReadAhead
+	defer func() {
+		if readAhead != nil {
+			readAhead.close()
+		}
+	}()
+
 	for {
-		data, err := b.c.ReadPacket()
+		var data []byte
+		var err error
+		if b.cfg.ReadAheadBufferSize > 0 && !b.cfg.SemiSyncEnabled {
+			if readAhead == nil {
+				readAhead = newPacketReadAhead(b.ctx, replicationPacketSource{b.c}, b.cfg.ReadAheadBufferSize)
+			}
+			data, err = readAhead.readPacket()
+		} else {
+			data, err = b.c.ReadPacket()
+		}
 		select {
 		case <-b.ctx.Done():
 			s.close()
@@ -808,7 +856,17 @@ func (b *BinlogSyncer) onStream(s *BinlogStreamer) {
 		}
 
 		if err != nil {
+			// Join the old producer before resetting parser/position state or
+			// replacing its connection. Pre-read data is never a resume position.
+			if readAhead != nil {
+				readAhead.close()
+				readAhead = nil
+			}
 			b.cfg.Logger.Error(err.Error())
+			if _, fatal := err.(*packetReadPanic); fatal {
+				s.closeWithError(err)
+				return
+			}
 			// we meet connection error, should re-connect again with
 			// last nextPos or nextGTID we got.
 			if len(b.nextPos.Name) == 0 && b.prevGset == nil {
@@ -853,11 +911,6 @@ func (b *BinlogSyncer) onStream(s *BinlogStreamer) {
 
 			// we connect the server and begin to re-sync again.
 			continue
-		}
-
-		// set read timeout
-		if b.cfg.ReadTimeout > 0 {
-			_ = b.c.SetReadDeadline(utils.Now().Add(b.cfg.ReadTimeout))
 		}
 
 		// Reset retry count on successful packet receieve
@@ -963,7 +1016,8 @@ func (b *BinlogSyncer) handleEventAndACK(s *BinlogStreamer, e *BinlogEvent, need
 			if err != nil {
 				return errors.Trace(err)
 			}
-			b.prevGset.(*mysql.MysqlGTIDSet).AddGTID(u, b.prevMySQLGTIDEvent.GNO)
+			// The previous event may be a tagged GTID even though this one is not.
+			b.prevGset.(*mysql.MysqlGTIDSet).AddGTIDWithTag(u, b.prevMySQLGTIDEvent.Tag, b.prevMySQLGTIDEvent.GNO)
 		}
 		b.prevMySQLGTIDEvent = event
 	case *GtidTaggedLogEvent:

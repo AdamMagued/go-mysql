@@ -134,13 +134,24 @@ func (c *Canal) handleEvent(ev *replication.BinlogEvent) error {
 		if err := c.eventHandler.OnGTID(ev.Header, e); err != nil {
 			return errors.Trace(err)
 		}
+	case *replication.GtidTaggedLogEvent:
+		if err := c.eventHandler.OnGTID(ev.Header, e); err != nil {
+			return errors.Trace(err)
+		}
 	case *replication.RowsQueryEvent:
 		if err := c.eventHandler.OnRowsQueryEvent(e); err != nil {
+			return errors.Trace(err)
+		}
+	case *replication.MariadbAnnotateRowsEvent:
+		if err := c.eventHandler.OnRowsQueryEvent(&replication.RowsQueryEvent{Query: e.Query}); err != nil {
 			return errors.Trace(err)
 		}
 	case *replication.QueryEvent:
 		stmts, _, err := c.parser.Parse(string(e.Query), "", "")
 		if err != nil {
+			if h, ok := c.eventHandler.(UnparsedQueryHandler); ok {
+				return errors.Trace(h.OnUnparsedQuery(ev.Header, pos, e, err))
+			}
 			// The parser does not understand all syntax.
 			// For example, it won't parse [CREATE|DROP] TRIGGER statements.
 			c.cfg.Logger.Error("error parsing query, will skip this event", slog.String("query", string(e.Query)), slog.Any("error", err))

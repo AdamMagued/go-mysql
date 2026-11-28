@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/binary"
+	stderrors "errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -22,6 +23,18 @@ type Stmt struct {
 
 	Context any
 
+	// paramTypes holds the parameter types from the last execution that sent them.
+	// Clients only send them again when they change (new-params-bound flag).
+	paramTypes []byte
+
+	// longData marks the parameters sent with COM_STMT_SEND_LONG_DATA since the last
+	// execution. COM_STMT_EXECUTE carries no inline value for them.
+	longData []bool
+
+	// cursor holds the result set of an execution that asked for a read-only
+	// cursor. COM_STMT_FETCH sends its rows in batches and drains RowDatas.
+	cursor *mysql.Resultset
+
 	// PreparedStmt contains common fields shared with client.Stmt for proxy passthrough
 	stmt.PreparedStmt
 }
@@ -35,6 +48,12 @@ func (s *Stmt) Rest(params int, columns int, context any) {
 
 func (s *Stmt) ResetParams() {
 	s.Args = make([]any, s.Params)
+	s.longData = make([]bool, s.Params)
+}
+
+// cursorsEnabled reports whether cursors are enabled; true without a Server.
+func (c *Conn) cursorsEnabled() bool {
+	return c.serverConf == nil || c.serverConf.CursorsEnabled()
 }
 
 func (c *Conn) writePrepare(s *Stmt) error {
@@ -105,7 +124,7 @@ func (c *Conn) writePrepare(s *Stmt) error {
 	return nil
 }
 
-func (c *Conn) handleStmtExecute(data []byte) (*mysql.Result, error) {
+func (c *Conn) handleStmtExecute(data []byte) (any, error) {
 	if len(data) < 9 {
 		return nil, mysql.ErrMalformPacket
 	}
@@ -124,6 +143,7 @@ func (c *Conn) handleStmtExecute(data []byte) (*mysql.Result, error) {
 	pos++
 	// Supported types:
 	// - CURSOR_TYPE_NO_CURSOR
+	// - CURSOR_TYPE_READ_ONLY
 	// - PARAMETER_COUNT_AVAILABLE
 
 	// Make sure the first 4 bits are 0.
@@ -132,9 +152,6 @@ func (c *Conn) handleStmtExecute(data []byte) (*mysql.Result, error) {
 	}
 
 	// Test for unsupported flags in the remaining 4 bits.
-	if flag&mysql.CURSOR_TYPE_READ_ONLY > 0 {
-		return nil, mysql.NewError(mysql.ER_UNKNOWN_ERROR, "unsupported flag CURSOR_TYPE_READ_ONLY")
-	}
 	if flag&mysql.CURSOR_TYPE_FOR_UPDATE > 0 {
 		return nil, mysql.NewError(mysql.ER_UNKNOWN_ERROR, "unsupported flag CURSOR_TYPE_FOR_UPDATE")
 	}
@@ -146,7 +163,6 @@ func (c *Conn) handleStmtExecute(data []byte) (*mysql.Result, error) {
 	pos += 4
 
 	var nullBitmaps []byte
-	var paramTypes []byte
 	var paramValues []byte
 
 	paramNum := s.Params
@@ -160,22 +176,36 @@ func (c *Conn) handleStmtExecute(data []byte) (*mysql.Result, error) {
 		pos += nullBitmapLen
 
 		// new param bound flag
-		if data[pos] == 1 {
-			pos++
+		newParamsBound := data[pos] == 1
+		pos++
+		if newParamsBound {
 			if len(data) < (pos + (paramNum << 1)) {
 				return nil, mysql.ErrMalformPacket
 			}
 
-			paramTypes = data[pos : pos+(paramNum<<1)]
+			// copy the types, the packet buffer is reused
+			s.paramTypes = append(s.paramTypes[:0], data[pos:pos+(paramNum<<1)]...)
 			pos += paramNum << 1
+		} else if s.paramTypes == nil && s.needsParamTypes(nullBitmaps) {
+			// the values can't be decoded without the types of a previous execution
+			return nil, mysql.NewDefaultError(mysql.ER_WRONG_ARGUMENTS, "mysqld_stmt_execute")
+		}
 
-			paramValues = data[pos:]
+		paramValues = data[pos:]
 
-			if err := c.bindStmtArgs(s, nullBitmaps, paramTypes, paramValues); err != nil {
+		// Without types every value is NULL or long data (the client sends no types
+		// for Execute(nil)), and s.Args already holds them.
+		if s.paramTypes != nil {
+			if err := c.bindStmtArgs(s, nullBitmaps, s.paramTypes, paramValues); err != nil {
 				return nil, errors.Trace(err)
 			}
 		}
 	}
+
+	// An execution closes the cursor a previous one left open, whether or not
+	// this one succeeds: a stale cursor would answer the next fetch with the
+	// previous execution's rows.
+	c.resetCursor(s)
 
 	var r *mysql.Result
 	var err error
@@ -185,7 +215,66 @@ func (c *Conn) handleStmtExecute(data []byte) (*mysql.Result, error) {
 
 	s.ResetParams()
 
-	return r, nil
+	// Streaming results, and all results when cursors are disabled, go inline.
+	if flag&mysql.CURSOR_TYPE_READ_ONLY == 0 || !c.cursorsEnabled() || r == nil || !r.HasResultset() || r.IsStreaming() {
+		return r, nil
+	}
+
+	// MySQL answers a cursor execution with the column definitions only; the
+	// rows are served by COM_STMT_FETCH, which reads them from s.cursor.
+	s.cursor = r.Resultset
+	c.SetStatus(mysql.SERVER_STATUS_CURSOR_EXISTS)
+
+	return cursorResult{r.Resultset}, nil
+}
+
+// handleStmtFetch serves COM_STMT_FETCH, which asks for the next num_rows rows
+// of the cursor opened by COM_STMT_EXECUTE.
+func (c *Conn) handleStmtFetch(data []byte) (any, error) {
+	if len(data) < 8 {
+		return nil, mysql.ErrMalformPacket
+	}
+
+	id := binary.LittleEndian.Uint32(data[0:4])
+	numRows := binary.LittleEndian.Uint32(data[4:8])
+
+	s, ok := c.stmts[id]
+	if !ok {
+		return nil, mysql.NewDefaultError(mysql.ER_UNKNOWN_STMT_HANDLER, 5,
+			strconv.FormatUint(uint64(id), 10), "stmt_fetch")
+	}
+
+	if s.cursor == nil {
+		return nil, mysql.NewDefaultError(mysql.ER_STMT_HAS_NO_OPEN_CURSOR, id)
+	}
+
+	// A count larger than what is left serves the rest. Zero is a request for
+	// no rows: the batch comes back empty and the cursor stays open, the same
+	// answer MySQL gives.
+	if n := uint64(len(s.cursor.RowDatas)); uint64(numRows) > n {
+		numRows = uint32(n)
+	}
+
+	rows := s.cursor.RowDatas[:numRows]
+	s.cursor.RowDatas = s.cursor.RowDatas[numRows:]
+
+	// dispatch clears the cursor flags before every command, so the batch that
+	// keeps the cursor open has to say so again.
+	if len(s.cursor.RowDatas) == 0 {
+		s.cursor = nil
+		c.SetStatus(mysql.SERVER_STATUS_LAST_ROW_SEND)
+	} else {
+		c.SetStatus(mysql.SERVER_STATUS_CURSOR_EXISTS)
+	}
+
+	return cursorRows(rows), nil
+}
+
+// resetCursor closes the cursor of s, if any, and clears its status flags.
+func (c *Conn) resetCursor(s *Stmt) {
+	s.cursor = nil
+	c.UnsetStatus(mysql.SERVER_STATUS_CURSOR_EXISTS)
+	c.UnsetStatus(mysql.SERVER_STATUS_LAST_ROW_SEND)
 }
 
 func (c *Conn) bindStmtArgs(s *Stmt, nullBitmap, paramTypes, paramValues []byte) error {
@@ -207,6 +296,11 @@ func (c *Conn) bindStmtArgs(s *Stmt, nullBitmap, paramTypes, paramValues []byte)
 	var err error
 
 	for i := 0; i < s.Params; i++ {
+		if s.isLongData(i) {
+			// no inline value, args[i] holds the data sent in advance
+			continue
+		}
+
 		if nullBitmap[i>>3]&(1<<(uint(i)%8)) > 0 {
 			args[i] = nil
 			continue
@@ -338,6 +432,11 @@ func (c *Conn) handleStmtSendLongData(data []byte) error {
 		return nil
 	}
 
+	if s.longData == nil {
+		s.longData = make([]bool, s.Params)
+	}
+	s.longData[paramID] = true
+
 	if s.Args[paramID] == nil {
 		s.Args[paramID] = data[6:]
 	} else {
@@ -366,6 +465,7 @@ func (c *Conn) handleStmtReset(data []byte) (*mysql.Result, error) {
 	}
 
 	s.ResetParams()
+	c.resetCursor(s)
 
 	return mysql.NewResultReserveResultset(0), nil
 }
@@ -387,7 +487,41 @@ func (c *Conn) handleStmtClose(data []byte) error {
 		return err
 	}
 
+	c.resetCursor(stmt)
 	delete(c.stmts, id)
 
 	return nil
+}
+
+// ResetStmts deallocates every prepared statement on the connection, calling
+// HandleStmtClose for each, as MySQL does on COM_RESET_CONNECTION and
+// COM_CHANGE_USER. A handler that implements COM_RESET_CONNECTION through
+// HandleOtherCommand calls it so that statement IDs the client no longer
+// holds stop resolving. Every statement is removed even if HandleStmtClose
+// fails; the errors are joined.
+func (c *Conn) ResetStmts() error {
+	var errs []error
+	for id, st := range c.stmts {
+		if err := c.h.HandleStmtClose(st.Context); err != nil {
+			errs = append(errs, err)
+		}
+		c.resetCursor(st)
+		delete(c.stmts, id)
+	}
+	return stderrors.Join(errs...)
+}
+
+func (s *Stmt) isLongData(i int) bool {
+	return i < len(s.longData) && s.longData[i]
+}
+
+// needsParamTypes reports whether a parameter that is neither NULL nor long data
+// is set, so its inline value can't be decoded without the parameter types.
+func (s *Stmt) needsParamTypes(nullBitmap []byte) bool {
+	for i := range s.Params {
+		if !s.isLongData(i) && nullBitmap[i>>3]&(1<<(uint(i)%8)) == 0 {
+			return true
+		}
+	}
+	return false
 }

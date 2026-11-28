@@ -19,6 +19,7 @@ type EventHandler interface {
 	// OnPosSynced Use your own way to sync position. When force is true, sync position immediately.
 	OnPosSynced(header *replication.EventHeader, pos mysql.Position, set mysql.GTIDSet, force bool) error
 	// OnRowsQueryEvent is called when binlog_rows_query_log_events=ON for each DML query.
+	// It is also called for each MariaDB annotate rows event when FillZeroLogPos is enabled.
 	// You'll get the original executed query, with comments if present.
 	// It will be called before OnRow.
 	OnRowsQueryEvent(e *replication.RowsQueryEvent) error
@@ -26,6 +27,15 @@ type EventHandler interface {
 	// that no longer exists.
 	OnTableNotFound(*replication.EventHeader, *replication.RowsEvent) error
 	String() string
+}
+
+// UnparsedQueryHandler is optional. If the EventHandler also implements it,
+// canal passes each QueryEvent its SQL parser cannot parse to OnUnparsedQuery
+// instead of skipping the event.
+// Canal does not know which tables such a statement changes, so it does not call
+// OnTableChanged or clear the table cache; call ClearTableCache if needed.
+type UnparsedQueryHandler interface {
+	OnUnparsedQuery(header *replication.EventHeader, nextPos mysql.Position, queryEvent *replication.QueryEvent, parseErr error) error
 }
 
 type DummyEventHandler struct{}

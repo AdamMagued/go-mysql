@@ -14,6 +14,8 @@ import (
 // Handler is what a server needs to implement the client-server protocol
 type Handler interface {
 	// handle COM_INIT_DB command, you can check whether the dbName is valid, or other.
+	// It also handles the database the client names in the handshake response: that one is
+	// selected once the client is authenticated, before OnAuthSuccess, and only if the name is not empty.
 	UseDB(dbName string) error
 	// handle COM_QUERY command, like SELECT, INSERT, UPDATE, etc...
 	// If Result has a Resultset (SELECT, SHOW, etc...), we will send this as the response, otherwise, we will send Result
@@ -76,6 +78,17 @@ func (c *Conn) HandleCommand() error {
 }
 
 func (c *Conn) dispatch(data []byte) any {
+	// Cursor flags describe the response to the command being handled. They
+	// live on the connection, so they are cleared here rather than left for
+	// whatever the next unrelated OK or EOF packet happens to report.
+	c.UnsetStatus(mysql.SERVER_STATUS_CURSOR_EXISTS)
+	c.UnsetStatus(mysql.SERVER_STATUS_LAST_ROW_SEND)
+
+	if len(data) == 0 {
+		// MySQL reads an empty packet as COM_SLEEP, which it rejects as an
+		// unknown command.
+		return mysql.NewDefaultError(mysql.ER_UNKNOWN_COM_ERROR)
+	}
 	cmd := data[0]
 	data = data[1:]
 
@@ -97,6 +110,11 @@ func (c *Conn) dispatch(data []byte) any {
 			return err
 		}
 		return nil
+	case mysql.COM_CHANGE_USER:
+		if h, ok := c.h.(ChangeUserHandler); ok {
+			return c.handleChangeUser(h, data)
+		}
+		return c.h.HandleOtherCommand(cmd, data)
 	case mysql.COM_FIELD_LIST:
 		before, after, _ := bytes.Cut(data, []byte{0x00})
 		table := utils.ByteSliceToString(before)
@@ -125,6 +143,12 @@ func (c *Conn) dispatch(data []byte) any {
 		return st
 	case mysql.COM_STMT_EXECUTE:
 		r, err := c.handleStmtExecute(data)
+		if err != nil {
+			return err
+		}
+		return r
+	case mysql.COM_STMT_FETCH:
+		r, err := c.handleStmtFetch(data)
 		if err != nil {
 			return err
 		}

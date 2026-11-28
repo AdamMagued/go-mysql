@@ -3,11 +3,11 @@ package replication
 import (
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
-	"github.com/klauspost/compress/zstd"
 )
 
 // On The Wire: Field Types
@@ -29,14 +29,13 @@ const (
 )
 
 type TransactionPayloadEvent struct {
-	format      FormatDescriptionEvent
-	concurrency int
+	format FormatDescriptionEvent
 	// parent is the BinlogParser that produced this event. The inner
 	// parser used to decode the decompressed payload inherits its
 	// user-settable options (UseDecimal, RenderJSONAsMySQLText, ...) so
-	// that compressed and uncompressed rows decode identically. nil when
-	// the event is constructed outside of BinlogParser, in which case
-	// decodePayload falls back to default parser options.
+	// that compressed and uncompressed rows decode identically. The
+	// parent also owns the decoder pool used by decodePayload, so it
+	// must be set before decoding.
 	parent           *BinlogParser
 	Size             uint64
 	UncompressedSize uint64
@@ -78,32 +77,71 @@ func (e *TransactionPayloadEvent) Decode(data []byte) error {
 }
 
 func (e *TransactionPayloadEvent) decodeFields(data []byte) error {
-	offset := uint64(0)
-
+	// MySQL writes the field type, the field length and the value with
+	// net_store_length (Transaction_payload::encode), so each of them is a
+	// length-encoded integer, not a fixed-width one.
 	for {
-		fieldType := mysql.FixedLengthInt(data[offset : offset+1])
-		offset++
-
-		if fieldType == OTW_PAYLOAD_HEADER_END_MARK {
-			e.Payload = data[offset:]
-			break
+		fieldType, n, err := payloadLengthEncodedInt(data)
+		if err != nil {
+			return err
 		}
-		fieldLength := mysql.FixedLengthInt(data[offset : offset+1])
-		offset++
+		data = data[n:]
+		if fieldType == OTW_PAYLOAD_HEADER_END_MARK {
+			e.Payload = data
+			return nil
+		}
+		fieldLength, n, err := payloadLengthEncodedInt(data)
+		if err != nil {
+			return err
+		}
+		data = data[n:]
+		if fieldLength > uint64(len(data)) {
+			return errors.New("TransactionPayloadEvent: header field runs past the event")
+		}
+		field := data[:fieldLength]
+		data = data[fieldLength:]
 
+		var dst *uint64
 		switch fieldType {
 		case OTW_PAYLOAD_SIZE_FIELD:
-			e.Size = mysql.FixedLengthInt(data[offset : offset+fieldLength])
+			dst = &e.Size
 		case OTW_PAYLOAD_COMPRESSION_TYPE_FIELD:
-			e.CompressionType = mysql.FixedLengthInt(data[offset : offset+fieldLength])
+			dst = &e.CompressionType
 		case OTW_PAYLOAD_UNCOMPRESSED_SIZE_FIELD:
-			e.UncompressedSize = mysql.FixedLengthInt(data[offset : offset+fieldLength])
+			dst = &e.UncompressedSize
+		default:
+			// Unknown fields are skipped by their length, as MySQL does.
+			continue
 		}
-
-		offset += fieldLength
+		if *dst, _, err = payloadLengthEncodedInt(field); err != nil {
+			return err
+		}
 	}
+}
 
-	return nil
+// payloadLengthEncodedInt decodes one net_store_length integer and returns
+// it with the number of bytes it occupies. Unlike mysql.LengthEncodedInt it
+// checks that the bytes are there.
+func payloadLengthEncodedInt(b []byte) (uint64, int, error) {
+	if len(b) == 0 {
+		return 0, 0, errors.New("TransactionPayloadEvent: truncated header")
+	}
+	need := 1
+	switch b[0] {
+	case 0xfb, 0xff:
+		return 0, 0, fmt.Errorf("TransactionPayloadEvent: invalid length-encoded integer 0x%x", b[0])
+	case 0xfc:
+		need = 3
+	case 0xfd:
+		need = 4
+	case 0xfe:
+		need = 9
+	}
+	if len(b) < need {
+		return 0, 0, errors.New("TransactionPayloadEvent: truncated header")
+	}
+	v, _, n := mysql.LengthEncodedInt(b)
+	return v, n, nil
 }
 
 // stampInnerEventPositions fixes LogPos of decoded inner events. MySQL copies
@@ -129,16 +167,21 @@ func (e *TransactionPayloadEvent) decodePayload() error {
 			e.CompressionType, e.compressionType())
 	}
 
-	decoder, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(e.concurrency))
+	// The parser caches one zstd decoder across events instead of
+	// building a new decoder per event; getPayloadDecoder reports
+	// creation errors.
+	decoder, err := e.parent.getPayloadDecoder()
 	if err != nil {
 		return err
 	}
-	defer decoder.Close()
-
 	payloadUncompressed, err := decoder.DecodeAll(e.Payload, nil)
 	if err != nil {
+		// Be conservative: close and drop the decoder instead of
+		// returning it to the cache.
+		decoder.Close()
 		return err
 	}
+	e.parent.putPayloadDecoder(decoder)
 
 	// The uncompressed data needs to be split up into individual events for Parse()
 	// to work on them. We can't use the parent parser directly as we need to disable

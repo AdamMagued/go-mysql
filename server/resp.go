@@ -368,9 +368,51 @@ func (c *Conn) writeBinlogEvents(s *replication.BinlogStreamer) error {
 	}
 }
 
+// writeCursorResultset writes the COM_STMT_EXECUTE response of a cursor: the
+// column definitions and their terminator, which carries
+// SERVER_STATUS_CURSOR_EXISTS. No rows are sent here, COM_STMT_FETCH sends them.
+func (c *Conn) writeCursorResultset(r *mysql.Resultset) error {
+	data := make([]byte, 4, 1024)
+	data = append(data, mysql.PutLengthEncodedInt(uint64(len(r.Fields)))...)
+	if err := c.WritePacket(data); err != nil {
+		return err
+	}
+
+	if err := c.writeFieldList(r.Fields, data); err != nil {
+		return err
+	}
+
+	// Under CLIENT_DEPRECATE_EOF this OK packet is the only terminator the
+	// client gets; without it, the client reads the status from the EOF.
+	return c.writeEOFOrOK()
+}
+
+// writeCursorRows writes a COM_STMT_FETCH response: a batch of already encoded
+// binary rows followed by an EOF carrying the cursor status flags.
+func (c *Conn) writeCursorRows(rows []mysql.RowData) error {
+	data := make([]byte, 4, 1024)
+	for _, v := range rows {
+		data = data[0:4]
+		data = append(data, v...)
+		if err := c.WritePacket(data); err != nil {
+			return err
+		}
+	}
+
+	return c.writeEOFOrOK()
+}
+
 type (
 	noResponse  struct{}
 	eofResponse struct{}
+	// closeConn sends err, then WriteValue returns it so that HandleCommand
+	// closes the connection and reports err.
+	closeConn struct{ err error }
+
+	// cursorResult is the response to a COM_STMT_EXECUTE that opened a cursor.
+	cursorResult struct{ rs *mysql.Resultset }
+	// cursorRows is the response to a COM_STMT_FETCH: one batch of rows.
+	cursorRows []mysql.RowData
 )
 
 func (c *Conn) WriteValue(value any) error {
@@ -379,6 +421,14 @@ func (c *Conn) WriteValue(value any) error {
 		return nil
 	case eofResponse:
 		return c.writeEOFOrOK()
+	case closeConn:
+		if err := c.writeError(v.err); err != nil {
+			return err
+		}
+		if err := c.Flush(); err != nil {
+			return err
+		}
+		return v.err
 	case error:
 		return c.writeError(v)
 	case nil:
@@ -402,6 +452,10 @@ func (c *Conn) WriteValue(value any) error {
 		return c.writeBinlogEvents(v)
 	case *Stmt:
 		return c.writePrepare(v)
+	case cursorResult:
+		return c.writeCursorResultset(v.rs)
+	case cursorRows:
+		return c.writeCursorRows(v)
 	default:
 		return fmt.Errorf("invalid response type %T", value)
 	}
